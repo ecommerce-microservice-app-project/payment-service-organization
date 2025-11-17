@@ -1,1 +1,1 @@
-# payment-service-organization.
+# payment-service-organization
