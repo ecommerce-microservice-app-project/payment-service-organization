@@ -1,0 +1,38 @@
+server:
+  port: 0  # Random port for testing
+  servlet:
+    context-path: /payment-service
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:testdb;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: 
+  jpa:
+    show-sql: true
+    hibernate:
+      ddl-auto: create-drop
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+        format_sql: true
+  h2:
+    console:
+      enabled: false
+
+eureka:
+  client:
+    enabled: false
+    register-with-eureka: false
+    fetch-registry: false
+
+logging:
+  level:
+    org:
+      hibernate:
+        SQL: INFO
+      springframework:
+        web: INFO
+        data: INFO
+    root: INFO
+
