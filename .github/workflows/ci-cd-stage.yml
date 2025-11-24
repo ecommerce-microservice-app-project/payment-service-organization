@@ -15,7 +15,7 @@ env:
   SERVICE_NAME: payment-service
   KUBERNETES_NAMESPACE: ecommerce-stage
   IMAGE_TAG: stage-latest
-  API_GATEWAY_URL: http://130.213.254.34:8080
+  API_GATEWAY_URL: ${{ secrets.API_GATEWAY_STAGE_URL || 'http://130.213.254.34:8080' }}
 
 jobs:
   build-and-test:

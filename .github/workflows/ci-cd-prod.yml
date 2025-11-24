@@ -1,0 +1,557 @@
+name: Payment Service - CI/CD Production
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: juanc7773/payment-service
+  SERVICE_NAME: payment-service
+  KUBERNETES_NAMESPACE: ecommerce-prod
+  IMAGE_TAG: prod-0.1.0
+  API_GATEWAY_STAGE_URL: ${{ secrets.API_GATEWAY_STAGE_URL || 'http://130.213.254.34:8080' }}
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      checks: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 11
+      uses: actions/setup-java@v4
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+        cache: maven
+        
+    - name: Build with Maven
+      run: |
+        mvn clean compile -DskipTests
+        
+    - name: Package Application
+      run: |
+        mvn clean package -DskipTests
+        
+  build-docker:
+    name: Build and Push Docker Image
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ env.IMAGE_TAG }}
+          type=sha,format=short
+          type=raw,value=0.1.0
+          
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+  deploy:
+    name: Deploy to Kubernetes (Production)
+    needs: build-docker
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Checkout infrastructure repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ secrets.INFRA_REPO }}
+        path: infra
+        
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS_PROD }}
+        
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID_PROD }}
+        
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+        
+    - name: Configure kubectl (GKE Cluster)
+      run: |
+        CLUSTER_NAME="${{ secrets.GKE_CLUSTER_NAME_PROD }}"
+        CLUSTER_LOCATION="${{ secrets.GKE_CLUSTER_LOCATION_PROD }}"
+        PROJECT_ID="${{ secrets.GCP_PROJECT_ID_PROD }}"
+        
+        echo "Connecting to GKE cluster: $CLUSTER_NAME in location: $CLUSTER_LOCATION"
+        gcloud container clusters get-credentials "$CLUSTER_NAME" \
+          --location "$CLUSTER_LOCATION" \
+          --project "$PROJECT_ID"
+        
+        # Verificar conexión
+        kubectl cluster-info
+        
+    - name: Create namespace if not exists
+      run: |
+        kubectl create namespace ${{ env.KUBERNETES_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Deploy to Kubernetes
+      run: |
+        IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+        
+        echo "Deploying image: $IMAGE_NAME to namespace: ${{ env.KUBERNETES_NAMESPACE }}"
+        
+        # Verificar y eliminar pods antiguos si existen (para strategy Recreate)
+        echo "Verificando pods existentes..."
+        EXISTING_PODS=$(kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        if [ -n "$EXISTING_PODS" ]; then
+          echo "Pods existentes encontrados: $EXISTING_PODS"
+          echo "Eliminando pods antiguos para permitir Recreate strategy..."
+          kubectl delete pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} --wait=false || true
+          echo "Esperando 10 segundos para que los pods se eliminen..."
+          sleep 10
+        fi
+        
+        # Create temporary deployment file from infra repo
+        cp infra/k8s/payment-service/deployment.yaml deployment.tmp.yaml
+        
+        # Replace image name
+        sed -i "s|<REGISTRY>/payment-service:0.1.0|${IMAGE_NAME}|g" deployment.tmp.yaml
+        
+        # Replace namespace placeholder
+        sed -i "s|<NAMESPACE>|${{ env.KUBERNETES_NAMESPACE }}|g" deployment.tmp.yaml
+        
+        # Create temporary configmap file and replace placeholders
+        cp infra/k8s/payment-service/configmap.yaml configmap.tmp.yaml
+        sed -i "s|<NAMESPACE>|${{ env.KUBERNETES_NAMESPACE }}|g" configmap.tmp.yaml
+        sed -i "s|<PROFILE>|prod|g" configmap.tmp.yaml
+        
+        kubectl apply -f deployment.tmp.yaml
+        kubectl apply -f configmap.tmp.yaml
+        
+        # Cleanup
+        rm deployment.tmp.yaml configmap.tmp.yaml
+        
+    - name: Force rollout restart (prod-0.1.0 tag)
+      run: |
+        echo "Tag estático detectado: ${{ env.IMAGE_TAG }}"
+        echo "Forzando rollout restart para asegurar descarga de nueva imagen..."
+        kubectl rollout restart deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
+        
+    - name: Check cluster resources
+      run: |
+        echo "=== Verificando nodos disponibles ==="
+        kubectl get nodes -o wide || true
+        echo ""
+        echo "=== Verificando taints en nodos ==="
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[*].key}{"="}{.spec.taints[*].value}{":"}{.spec.taints[*].effect}{"\n"}{end}' || true
+        echo ""
+        echo "=== Verificando recursos disponibles ==="
+        kubectl top nodes 2>/dev/null || echo "kubectl top no disponible (requiere metrics-server)"
+        echo ""
+        echo "=== Verificando pods en el namespace ==="
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} || true
+        
+    - name: Check pod status before waiting
+      run: |
+        echo "=== Pod Status ==="
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} || true
+        echo ""
+        echo "=== Pod Events ==="
+        POD_NAME=$(kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        if [ -n "$POD_NAME" ]; then
+          echo "Pod name: $POD_NAME"
+          kubectl describe pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} || true
+          echo ""
+          echo "=== Pod Logs (last 50 lines) ==="
+          kubectl logs $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} --tail=50 || true
+        fi
+        
+    - name: Wait for deployment
+      run: |
+        echo "Esperando a que el deployment esté listo (timeout: 600s)..."
+        # Intentar esperar el rollout, pero con verificación periódica del estado
+        timeout=600
+        elapsed=0
+        interval=10
+        
+        while [ $elapsed -lt $timeout ]; do
+          # Verificar si el rollout está completo
+          if kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=${interval}s 2>/dev/null; then
+            echo "Deployment completado exitosamente"
+            exit 0
+          fi
+          
+          # Verificar el estado del pod
+          POD_NAME=$(kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$POD_NAME" ]; then
+            POD_STATUS=$(kubectl get pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            echo "Pod status: $POD_STATUS (elapsed: ${elapsed}s)"
+            
+            # Si el pod está en Pending por más de 60 segundos, mostrar detalles
+            if [ "$POD_STATUS" = "Pending" ] && [ $elapsed -ge 60 ]; then
+              echo "Pod en Pending por más de 60s. Investigando causa..."
+              kubectl describe pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} || true
+              echo ""
+              echo "=== Verificando nodos disponibles ==="
+              kubectl get nodes -o wide || true
+              echo ""
+              echo "=== Verificando taints en nodos ==="
+              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[*].key}{"="}{.spec.taints[*].value}{":"}{.spec.taints[*].effect}{"\n"}{end}' || true
+              echo ""
+              echo "=== Verificando recursos disponibles ==="
+              kubectl top nodes 2>/dev/null || echo "kubectl top no disponible"
+              # Si está en Pending por más de 120s, salir con error
+              if [ $elapsed -ge 120 ]; then
+                echo "ERROR: Pod en Pending por más de 120s. Posibles causas:"
+                echo "1. No hay nodos disponibles con las tolerations correctas"
+                echo "2. Recursos insuficientes en los nodos"
+                echo "3. Problema con imagePullPolicy o registry"
+                exit 1
+              fi
+            fi
+            
+            # Si el pod está en CrashLoopBackOff o Error, mostrar logs y salir
+            if [ "$POD_STATUS" = "Failed" ] || kubectl get pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null | grep -q "CrashLoopBackOff"; then
+              echo "Pod está en estado de error. Mostrando logs..."
+              kubectl logs $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} --tail=100 || true
+              kubectl describe pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} || true
+              echo "Deployment falló - pod no puede iniciar correctamente"
+              exit 1
+            fi
+          fi
+          
+          elapsed=$((elapsed + interval))
+          sleep $interval
+        done
+        
+        echo "Timeout alcanzado después de ${timeout}s. Verificando estado final..."
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} || true
+        kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=5s || true
+        
+    - name: Verify deployment
+      run: |
+        echo "=== Pods ==="
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
+        echo ""
+        echo "=== Services ==="
+        kubectl get svc -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
+        echo ""
+        echo "=== Deployment Status ==="
+        kubectl get deployment ${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
+
+  e2e-tests:
+    name: Run E2E Tests
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout API Gateway Repository (para E2E tests)
+      uses: actions/checkout@v4
+      with:
+        repository: ecommerce-microservice-app-project/api-gateway-organization
+        path: api-gateway
+        ref: main
+        
+    - name: Install Newman
+      run: |
+        npm install -g newman newman-reporter-html
+        
+    - name: Wait for services to be ready
+      run: |
+        echo "Esperando 30 segundos para que todos los servicios estén listos..."
+        sleep 30
+        
+    - name: Run E2E Tests
+      run: |
+        newman run api-gateway/e2e-tests/postman/e2e-tests.postman_collection.json \
+          --environment api-gateway/e2e-tests/postman/environment-stage.json \
+          --reporters cli,html,json \
+          --reporter-html-export e2e-report.html \
+          --reporter-json-export e2e-results.json \
+          --timeout-request 60000
+        
+    - name: Upload E2E Test Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-test-report-prod
+        path: |
+          e2e-report.html
+          e2e-results.json
+        retention-days: 30
+
+  performance-tests:
+    name: Run Performance Tests (Locust)
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout API Gateway Repository (para performance tests)
+      uses: actions/checkout@v4
+      with:
+        repository: ecommerce-microservice-app-project/api-gateway-organization
+        path: api-gateway
+        ref: main
+        
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        
+    - name: Install dependencies
+      run: |
+        cd api-gateway/performance-tests
+        pip install -r requirements.txt
+        
+    - name: Wait for services to be ready
+      run: |
+        echo "Esperando 30 segundos para que todos los servicios estén listos..."
+        sleep 30
+        
+    - name: Run Performance Tests
+      run: |
+        cd api-gateway/performance-tests
+        locust -f locustfile.py \
+          --host=${{ env.API_GATEWAY_STAGE_URL }} \
+          --users=50 \
+          --spawn-rate=5 \
+          --run-time=2m \
+          --headless \
+          --html=locust-report.html \
+          --csv=locust-results \
+          --loglevel=INFO
+        
+    - name: Upload Performance Test Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-test-report-prod
+        path: |
+          api-gateway/performance-tests/locust-report.html
+          api-gateway/performance-tests/locust-results*.csv
+        retention-days: 30
+
+  release-notes:
+    name: Generate Release Notes
+    needs: [deploy, e2e-tests, performance-tests]
+    runs-on: ubuntu-latest
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      github.event_name != 'pull_request'
+    
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Necesario para obtener todo el historial
+    
+    - name: Set environment for prod
+      id: env
+      run: |
+        # Este pipeline es solo para prod, siempre usa prod-0.1.0
+        echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
+        echo "ENV_NAME=production" >> $GITHUB_OUTPUT
+    
+    - name: Get latest tag
+      id: get_tag
+      run: |
+        TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$TAG" ]; then
+          echo "No previous tags found, will use first commit"
+          echo "PREVIOUS_TAG=" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=false" >> $GITHUB_OUTPUT
+        else
+          echo "Previous tag: $TAG"
+          echo "PREVIOUS_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "HAS_PREVIOUS_TAG=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get commits since last tag (or from push)
+      id: get_commits
+      run: |
+        # Obtener commits del push actual (más confiable que usar tags)
+        # Si hay commits en el evento, usarlos; si no, usar desde el último tag o HEAD~1
+        if [ -n "${{ github.event.head_commit.message }}" ]; then
+          # Usar el commit del evento actual
+          COMMITS="${{ github.event.head_commit.message }}"
+          echo "Using commit from event: $COMMITS"
+        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges)
+        else
+          # Si no hay tag, obtener el último commit
+          COMMITS=$(git log -1 --pretty=format:"%s" HEAD)
+        fi
+        
+        # Guardar commits en output para debugging
+        echo "$COMMITS" > /tmp/commits.txt
+        echo "=== Commits found ==="
+        echo "$COMMITS"
+        echo "===================="
+        
+        # Verificar si hay commits con prefijos convencionales
+        # Regex mejorada: permite espacios después del prefijo
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        
+        # Probar cada línea de commit
+        HAS_VALID=false
+        while IFS= read -r line; do
+          if [ -n "$line" ] && echo "$line" | grep -qE "$PREFIXES"; then
+            echo "✓ Valid commit found: $line"
+            HAS_VALID=true
+          fi
+        done <<< "$COMMITS"
+        
+        if [ "$HAS_VALID" == "true" ]; then
+          echo "HAS_VALID_COMMITS=true" >> $GITHUB_OUTPUT
+          echo "✓ Commits with conventional prefixes found"
+        else
+          echo "HAS_VALID_COMMITS=false" >> $GITHUB_OUTPUT
+          echo "✗ No commits with conventional prefixes found"
+          echo "Looking for prefixes: chore:, feature:, feat:, fix:, docs:, refactor:, test:, style:, perf:, ci:, build:"
+        fi
+    
+    - name: Generate Release Notes
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS == 'true'
+      id: release_notes
+      run: |
+        # Obtener commits de la misma manera que en el step anterior
+        if [ -n "${{ github.event.head_commit.message }}" ]; then
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          echo "Using commit from event: $COMMIT_MSG"
+        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
+          COMMIT_MSG=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges | head -1)
+        else
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s" HEAD)
+        fi
+        
+        echo "Processing commit: $COMMIT_MSG"
+        
+        # Filtrar solo commits con prefijos válidos (antes de agregar el prefijo "- ")
+        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
+        FILTERED_COMMITS=$(echo "$COMMIT_MSG" | grep -E "$PREFIXES" | sed 's/^/- /' || echo "")
+        
+        if [ -z "$FILTERED_COMMITS" ]; then
+          echo "No valid commits found after filtering, skipping release"
+          echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        echo "Filtered commits:"
+        echo "$FILTERED_COMMITS"
+        
+        # Generar release notes usando archivo temporal para evitar problemas de sintaxis YAML
+        IMAGE_TAG="${{ steps.env.outputs.IMAGE_TAG }}"
+        NAMESPACE="${{ env.KUBERNETES_NAMESPACE }}"
+        SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        DEPLOY_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        
+        # Construir release notes línea por línea
+        {
+          echo "# Release $IMAGE_TAG"
+          echo ""
+          echo "## Changes"
+          echo ""
+          echo "$FILTERED_COMMITS"
+          echo ""
+          echo "## Deployment Info"
+          echo ""
+          echo "- **Image Tag**: $IMAGE_TAG"
+          echo "- **Namespace**: $NAMESPACE"
+          echo "- **Service**: $SERVICE_NAME"
+          echo "- **Deployed at**: $DEPLOY_TIME"
+        } > /tmp/release_notes.md
+        
+        # Leer el contenido del archivo y usar multiline output
+        RELEASE_NOTES=$(cat /tmp/release_notes.md)
+        
+        # Usar delimitador personalizado para multiline output
+        {
+          echo "RELEASE_NOTES<<RELEASE_NOTES_EOF"
+          echo "$RELEASE_NOTES"
+          echo "RELEASE_NOTES_EOF"
+        } >> $GITHUB_OUTPUT
+        
+        echo "SKIP_RELEASE=false" >> $GITHUB_OUTPUT
+        
+        echo "Release Notes generated:"
+        cat /tmp/release_notes.md
+    
+    - name: Create GitHub Release
+      if: |
+        steps.get_commits.outputs.HAS_VALID_COMMITS == 'true' &&
+        steps.release_notes.outputs.SKIP_RELEASE != 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.env.outputs.IMAGE_TAG }}
+        name: Release ${{ steps.env.outputs.IMAGE_TAG }} - ${{ env.SERVICE_NAME }}
+        body_path: /tmp/release_notes.md
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Skip Release (no valid commits)
+      if: steps.get_commits.outputs.HAS_VALID_COMMITS != 'true'
+      run: |
+        echo "⚠ Skipping release: No commits with conventional prefixes found"
+        echo "Commits must have prefixes like: chore:, feat:, fix:, etc."
+
