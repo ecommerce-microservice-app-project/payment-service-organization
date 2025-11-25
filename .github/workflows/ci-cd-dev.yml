@@ -41,9 +41,9 @@ jobs:
       run: |
         mvn clean compile -DskipTests
         
-    - name: Run Unit Tests
+    - name: Run Unit Tests with Coverage
       run: |
-        mvn test || true
+        mvn test jacoco:report || true
         
     - name: Generate Test Report
       if: always()
@@ -53,6 +53,17 @@ jobs:
         path: target/surefire-reports/*.xml
         reporter: java-junit
         fail-on-error: false
+        
+    - name: Upload Code Coverage Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-coverage-report
+        path: |
+          target/site/jacoco/index.html
+          target/site/jacoco/jacoco.xml
+          target/site/jacoco/jacoco.csv
+        retention-days: 30
         
     - name: Package Application
       run: |
