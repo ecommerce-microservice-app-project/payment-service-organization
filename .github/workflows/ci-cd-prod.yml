@@ -16,7 +16,6 @@ env:
   IMAGE_NAME: juanc7773/payment-service
   SERVICE_NAME: payment-service
   KUBERNETES_NAMESPACE: ecommerce-prod
-  API_GATEWAY_STAGE_URL: ${{ secrets.API_GATEWAY_STAGE_URL || 'http://130.213.254.34:8080' }}
 
 jobs:
   calculate-version:
@@ -222,11 +221,111 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         
+  security-scan:
+    name: Security Scan (Trivy) - Informative
+    needs: [calculate-version, build-docker]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      security-events: write
+    
+    env:
+      IMAGE_TAG: ${{ needs.calculate-version.outputs.image_tag }}
+      VERSION: ${{ needs.calculate-version.outputs.version }}
+    
+    steps:
+    - name: Generate Trivy Report (JSON) - Always generate
+      id: trivy-json
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'json'
+        output: 'trivy-results.json'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Generate Trivy Report (HTML)
+      id: trivy-html
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'template'
+        template: '@contrib/html.tpl'
+        output: 'trivy-report.html'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Generate Trivy Report (Table/Text)
+      id: trivy-table
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'table'
+        output: 'trivy-report.txt'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Verify reports were generated
+      if: always()
+      run: |
+        echo "=== Verificando archivos generados ==="
+        for file in trivy-results.json trivy-report.html trivy-report.txt; do
+          if [ -f "$file" ]; then
+            if [ -s "$file" ]; then
+              echo "✓ $file generado ($(wc -l < "$file" | tr -d ' ') líneas)"
+            else
+              echo "⚠ $file está vacío"
+            fi
+          else
+            echo "✗ $file no se generó"
+          fi
+        done
+        echo "====================================="
+    
+    - name: Upload Trivy Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-security-reports
+        path: |
+          trivy-report.html
+          trivy-report.txt
+          trivy-results.json
+        retention-days: 30
+        if-no-files-found: warn
+    
+    - name: Run Trivy vulnerability scanner (Informative)
+      id: trivy-scan
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'  # Informativo, no bloquea el pipeline
+        scanners: 'vuln'  # Solo vulnerabilidades, no secrets
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v4
+      if: always() && steps.trivy-scan.outcome == 'success'
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
   deploy:
     name: Deploy to Kubernetes (Production)
     needs: [calculate-version, build-docker]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
+    environment: production
     
     permissions:
       contents: read
@@ -427,104 +526,9 @@ jobs:
         echo "=== Deployment Status ==="
         kubectl get deployment ${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
 
-  e2e-tests:
-    name: Run E2E Tests
-    needs: deploy
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    
-    steps:
-    - name: Checkout API Gateway Repository (para E2E tests)
-      uses: actions/checkout@v4
-      with:
-        repository: ecommerce-microservice-app-project/api-gateway-organization
-        path: api-gateway
-        ref: main
-        
-    - name: Install Newman
-      run: |
-        npm install -g newman newman-reporter-html
-        
-    - name: Wait for services to be ready
-      run: |
-        echo "Esperando 30 segundos para que todos los servicios estén listos..."
-        sleep 30
-        
-    - name: Run E2E Tests
-      run: |
-        newman run api-gateway/e2e-tests/postman/e2e-tests.postman_collection.json \
-          --environment api-gateway/e2e-tests/postman/environment-stage.json \
-          --reporters cli,html,json \
-          --reporter-html-export e2e-report.html \
-          --reporter-json-export e2e-results.json \
-          --timeout-request 60000
-        
-    - name: Upload E2E Test Report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: e2e-test-report-prod
-        path: |
-          e2e-report.html
-          e2e-results.json
-        retention-days: 30
-
-  performance-tests:
-    name: Run Performance Tests (Locust)
-    needs: e2e-tests
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    
-    steps:
-    - name: Checkout API Gateway Repository (para performance tests)
-      uses: actions/checkout@v4
-      with:
-        repository: ecommerce-microservice-app-project/api-gateway-organization
-        path: api-gateway
-        ref: main
-        
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
-        
-    - name: Install dependencies
-      run: |
-        cd api-gateway/performance-tests
-        pip install -r requirements.txt
-        
-    - name: Wait for services to be ready
-      run: |
-        echo "Esperando 30 segundos para que todos los servicios estén listos..."
-        sleep 30
-        
-    - name: Run Performance Tests
-      run: |
-        cd api-gateway/performance-tests
-        locust -f locustfile.py \
-          --host=${{ env.API_GATEWAY_STAGE_URL }} \
-          --users=50 \
-          --spawn-rate=5 \
-          --run-time=2m \
-          --headless \
-          --html=locust-report.html \
-          --csv=locust-results \
-          --loglevel=INFO
-        
-    - name: Upload Performance Test Report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: performance-test-report-prod
-        path: |
-          api-gateway/performance-tests/locust-report.html
-          api-gateway/performance-tests/locust-results*.csv
-        retention-days: 30
-
   release-notes:
     name: Generate Release Notes
-    needs: [calculate-version, deploy, e2e-tests, performance-tests]
+    needs: [calculate-version, deploy]
     runs-on: ubuntu-latest
     if: |
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&

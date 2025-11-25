@@ -113,6 +113,93 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         
+  security-scan:
+    name: Security Scan (Trivy) - Informative
+    needs: build-docker
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+    - name: Generate Trivy Report (JSON) - Always generate
+      id: trivy-json
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'json'
+        output: 'trivy-results.json'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Generate Trivy Report (HTML) - Always generate
+      id: trivy-html
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'template'
+        template: '@contrib/html.tpl'
+        output: 'trivy-report.html'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Generate Trivy Report (TXT) - Fallback
+      id: trivy-txt
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'table'
+        output: 'trivy-report.txt'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Verify reports were generated
+      if: always()
+      run: |
+        echo "Verificando reportes generados:"
+        ls -lh trivy-report.* || true
+        if [ -f trivy-results.json ] && [ -s trivy-results.json ]; then echo "✓ Reporte JSON generado y con contenido"; else echo "⚠ Reporte JSON vacío o no generado"; fi
+        if [ -f trivy-report.html ] && [ -s trivy-report.html ]; then echo "✓ Reporte HTML generado y con contenido"; else echo "⚠ Reporte HTML vacío o no generado"; fi
+        if [ -f trivy-report.txt ] && [ -s trivy-report.txt ]; then echo "✓ Reporte TXT generado y con contenido"; else echo "⚠ Reporte TXT vacío o no generado"; fi
+    
+    - name: Upload Trivy Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-security-reports-stage
+        path: |
+          trivy-report.json
+          trivy-report.html
+          trivy-report.txt
+        retention-days: 30
+        if-no-files-found: warn
+    
+    - name: Run Trivy vulnerability scanner (Informative)
+      id: trivy-scan-informative
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        exit-code: '0'
+        scanners: 'vuln'
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v4
+      if: always() && steps.trivy-scan-informative.outcome == 'success'
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
   deploy:
     name: Deploy to Kubernetes (Stage)
     needs: build-docker
