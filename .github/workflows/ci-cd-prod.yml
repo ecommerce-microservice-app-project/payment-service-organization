@@ -16,17 +16,120 @@ env:
   IMAGE_NAME: juanc7773/payment-service
   SERVICE_NAME: payment-service
   KUBERNETES_NAMESPACE: ecommerce-prod
-  IMAGE_TAG: prod-0.1.0
   API_GATEWAY_STAGE_URL: ${{ secrets.API_GATEWAY_STAGE_URL || 'http://130.213.254.34:8080' }}
 
 jobs:
+  calculate-version:
+    name: Calculate Semantic Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Calculate Semantic Version
+      id: version
+      run: |
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "Last tag: $LAST_TAG"
+        
+        LAST_VERSION=$(echo "$LAST_TAG" | sed 's/^v//' | sed 's/^prod-//')
+        if [ -z "$LAST_VERSION" ] || [ "$LAST_VERSION" == "0.0.0" ]; then
+          LAST_VERSION="0.0.0"
+        fi
+        
+        echo "Last version: $LAST_VERSION"
+        
+        COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"%s" --no-merges 2>/dev/null || git log -10 --pretty=format:"%s" --no-merges)
+        
+        if [ -z "$COMMITS" ]; then
+          echo "No new commits, using last version"
+          NEW_VERSION="$LAST_VERSION"
+        else
+          echo "=== Commits since last tag ==="
+          echo "$COMMITS"
+          echo "=============================="
+          
+          MAJOR=0
+          MINOR=0
+          PATCH=0
+          
+          while IFS= read -r commit; do
+            if [ -n "$commit" ]; then
+              if echo "$commit" | grep -qiE "BREAKING CHANGE|breaking:"; then
+                MAJOR=1
+                echo "✓ BREAKING CHANGE detected"
+              elif echo "$commit" | grep -qiE "^(feat|feature):"; then
+                MINOR=1
+                echo "✓ feat detected"
+              elif echo "$commit" | grep -qiE "^(fix|bugfix):"; then
+                PATCH=1
+                echo "✓ fix detected"
+              fi
+            fi
+          done <<< "$COMMITS"
+          
+          IFS='.' read -r MAJOR_CURRENT MINOR_CURRENT PATCH_CURRENT <<< "$LAST_VERSION"
+          
+          if [ "$MAJOR" -eq 1 ]; then
+            NEW_MAJOR=$((MAJOR_CURRENT + 1))
+            NEW_MINOR=0
+            NEW_PATCH=0
+            echo "Incrementing MAJOR version"
+          elif [ "$MINOR" -eq 1 ]; then
+            NEW_MAJOR=$MAJOR_CURRENT
+            NEW_MINOR=$((MINOR_CURRENT + 1))
+            NEW_PATCH=0
+            echo "Incrementing MINOR version"
+          elif [ "$PATCH" -eq 1 ]; then
+            NEW_MAJOR=$MAJOR_CURRENT
+            NEW_MINOR=$MINOR_CURRENT
+            NEW_PATCH=$((PATCH_CURRENT + 1))
+            echo "Incrementing PATCH version"
+          else
+            NEW_MAJOR=$MAJOR_CURRENT
+            NEW_MINOR=$MINOR_CURRENT
+            NEW_PATCH=$((PATCH_CURRENT + 1))
+            echo "No conventional commits found, incrementing PATCH"
+          fi
+          
+          NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
+        fi
+        
+        IMAGE_TAG="prod-${NEW_VERSION}"
+        
+        echo "New version: $NEW_VERSION"
+        echo "New image tag: $IMAGE_TAG"
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "VERSION=$NEW_VERSION" >> $GITHUB_ENV
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+    
+    - name: Display Version Info
+      run: |
+        echo "Calculated version: ${{ steps.version.outputs.version }}"
+        echo "Image tag: ${{ steps.version.outputs.image_tag }}"
+
   build-and-test:
     name: Build and Test
+    needs: calculate-version
     runs-on: ubuntu-latest
     
     permissions:
       contents: read
       checks: write
+    
+    env:
+      IMAGE_TAG: ${{ needs.calculate-version.outputs.image_tag }}
+      VERSION: ${{ needs.calculate-version.outputs.version }}
     
     steps:
     - name: Checkout code
@@ -73,13 +176,17 @@ jobs:
         
   build-docker:
     name: Build and Push Docker Image
-    needs: build-and-test
+    needs: [calculate-version, build-and-test]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     
     permissions:
       contents: read
       packages: write
+    
+    env:
+      IMAGE_TAG: ${{ needs.calculate-version.outputs.image_tag }}
+      VERSION: ${{ needs.calculate-version.outputs.version }}
       
     steps:
     - name: Checkout code
@@ -99,7 +206,7 @@ jobs:
         tags: |
           type=raw,value=${{ env.IMAGE_TAG }}
           type=sha,format=short
-          type=raw,value=0.1.0
+          type=raw,value=${{ env.VERSION }}
           
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -117,12 +224,16 @@ jobs:
         
   deploy:
     name: Deploy to Kubernetes (Production)
-    needs: build-docker
+    needs: [calculate-version, build-docker]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     
     permissions:
       contents: read
+    
+    env:
+      IMAGE_TAG: ${{ needs.calculate-version.outputs.image_tag }}
+      VERSION: ${{ needs.calculate-version.outputs.version }}
     
     steps:
     - name: Checkout code
@@ -413,7 +524,7 @@ jobs:
 
   release-notes:
     name: Generate Release Notes
-    needs: [deploy, e2e-tests, performance-tests]
+    needs: [calculate-version, deploy, e2e-tests, performance-tests]
     runs-on: ubuntu-latest
     if: |
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
@@ -422,115 +533,51 @@ jobs:
     permissions:
       contents: write
     
+    env:
+      IMAGE_TAG: ${{ needs.calculate-version.outputs.image_tag }}
+      VERSION: ${{ needs.calculate-version.outputs.version }}
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Necesario para obtener todo el historial
+        fetch-depth: 0
     
-    - name: Set environment for prod
-      id: env
-      run: |
-        # Este pipeline es solo para prod, siempre usa prod-0.1.0
-        echo "IMAGE_TAG=prod-0.1.0" >> $GITHUB_OUTPUT
-        echo "ENV_NAME=production" >> $GITHUB_OUTPUT
-    
-    - name: Get latest tag
-      id: get_tag
-      run: |
-        TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-        if [ -z "$TAG" ]; then
-          echo "No previous tags found, will use first commit"
-          echo "PREVIOUS_TAG=" >> $GITHUB_OUTPUT
-          echo "HAS_PREVIOUS_TAG=false" >> $GITHUB_OUTPUT
-        else
-          echo "Previous tag: $TAG"
-          echo "PREVIOUS_TAG=$TAG" >> $GITHUB_OUTPUT
-          echo "HAS_PREVIOUS_TAG=true" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Get commits since last tag (or from push)
+    - name: Get commits since last tag
       id: get_commits
       run: |
-        # Obtener commits del push actual (más confiable que usar tags)
-        # Si hay commits en el evento, usarlos; si no, usar desde el último tag o HEAD~1
-        if [ -n "${{ github.event.head_commit.message }}" ]; then
-          # Usar el commit del evento actual
-          COMMITS="${{ github.event.head_commit.message }}"
-          echo "Using commit from event: $COMMITS"
-        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
-          COMMITS=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges)
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log -10 --pretty=format:"%s" --no-merges)
+          echo "No previous tag found, using last 10 commits"
         else
-          # Si no hay tag, obtener el último commit
-          COMMITS=$(git log -1 --pretty=format:"%s" HEAD)
+          COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"%s" --no-merges)
+          echo "Commits since $LAST_TAG:"
         fi
         
-        # Guardar commits en output para debugging
         echo "$COMMITS" > /tmp/commits.txt
         echo "=== Commits found ==="
         echo "$COMMITS"
         echo "===================="
-        
-        # Verificar si hay commits con prefijos convencionales
-        # Regex mejorada: permite espacios después del prefijo
-        PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
-        
-        # Probar cada línea de commit
-        HAS_VALID=false
-        while IFS= read -r line; do
-          if [ -n "$line" ] && echo "$line" | grep -qE "$PREFIXES"; then
-            echo "✓ Valid commit found: $line"
-            HAS_VALID=true
-          fi
-        done <<< "$COMMITS"
-        
-        if [ "$HAS_VALID" == "true" ]; then
-          echo "HAS_VALID_COMMITS=true" >> $GITHUB_OUTPUT
-          echo "✓ Commits with conventional prefixes found"
-        else
-          echo "HAS_VALID_COMMITS=false" >> $GITHUB_OUTPUT
-          echo "✗ No commits with conventional prefixes found"
-          echo "Looking for prefixes: chore:, feature:, feat:, fix:, docs:, refactor:, test:, style:, perf:, ci:, build:"
-        fi
     
     - name: Generate Release Notes
-      if: steps.get_commits.outputs.HAS_VALID_COMMITS == 'true'
       id: release_notes
       run: |
-        # Obtener commits de la misma manera que en el step anterior
-        if [ -n "${{ github.event.head_commit.message }}" ]; then
-          COMMIT_MSG="${{ github.event.head_commit.message }}"
-          echo "Using commit from event: $COMMIT_MSG"
-        elif [ "${{ steps.get_tag.outputs.HAS_PREVIOUS_TAG }}" == "true" ]; then
-          COMMIT_MSG=$(git log ${{ steps.get_tag.outputs.PREVIOUS_TAG }}..HEAD --pretty=format:"%s" --no-merges | head -1)
-        else
-          COMMIT_MSG=$(git log -1 --pretty=format:"%s" HEAD)
-        fi
+        COMMITS=$(cat /tmp/commits.txt)
         
-        echo "Processing commit: $COMMIT_MSG"
-        
-        # Filtrar solo commits con prefijos válidos (antes de agregar el prefijo "- ")
         PREFIXES="^(chore|feature|feat|fix|docs|refactor|test|style|perf|ci|build):"
-        FILTERED_COMMITS=$(echo "$COMMIT_MSG" | grep -E "$PREFIXES" | sed 's/^/- /' || echo "")
+        FILTERED_COMMITS=$(echo "$COMMITS" | grep -E "$PREFIXES" | sed 's/^/- /' || echo "")
         
         if [ -z "$FILTERED_COMMITS" ]; then
-          echo "No valid commits found after filtering, skipping release"
-          echo "SKIP_RELEASE=true" >> $GITHUB_OUTPUT
-          exit 0
+          FILTERED_COMMITS="- No conventional commits found"
         fi
         
-        echo "Filtered commits:"
-        echo "$FILTERED_COMMITS"
-        
-        # Generar release notes usando archivo temporal para evitar problemas de sintaxis YAML
-        IMAGE_TAG="${{ steps.env.outputs.IMAGE_TAG }}"
-        NAMESPACE="${{ env.KUBERNETES_NAMESPACE }}"
-        SERVICE_NAME="${{ env.SERVICE_NAME }}"
         DEPLOY_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
         
-        # Construir release notes línea por línea
         {
-          echo "# Release $IMAGE_TAG"
+          echo "# Release ${{ env.IMAGE_TAG }}"
+          echo ""
+          echo "## Version: ${{ env.VERSION }}"
           echo ""
           echo "## Changes"
           echo ""
@@ -538,44 +585,31 @@ jobs:
           echo ""
           echo "## Deployment Info"
           echo ""
-          echo "- **Image Tag**: $IMAGE_TAG"
-          echo "- **Namespace**: $NAMESPACE"
-          echo "- **Service**: $SERVICE_NAME"
+          echo "- **Image Tag**: ${{ env.IMAGE_TAG }}"
+          echo "- **Version**: ${{ env.VERSION }}"
+          echo "- **Namespace**: ${{ env.KUBERNETES_NAMESPACE }}"
+          echo "- **Service**: ${{ env.SERVICE_NAME }}"
           echo "- **Deployed at**: $DEPLOY_TIME"
         } > /tmp/release_notes.md
-        
-        # Leer el contenido del archivo y usar multiline output
-        RELEASE_NOTES=$(cat /tmp/release_notes.md)
-        
-        # Usar delimitador personalizado para multiline output
-        {
-          echo "RELEASE_NOTES<<RELEASE_NOTES_EOF"
-          echo "$RELEASE_NOTES"
-          echo "RELEASE_NOTES_EOF"
-        } >> $GITHUB_OUTPUT
-        
-        echo "SKIP_RELEASE=false" >> $GITHUB_OUTPUT
         
         echo "Release Notes generated:"
         cat /tmp/release_notes.md
     
+    - name: Create Git Tag
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git tag -a "${{ env.IMAGE_TAG }}" -m "Release ${{ env.VERSION }} - ${{ env.SERVICE_NAME }}"
+        git push origin "${{ env.IMAGE_TAG }}"
+    
     - name: Create GitHub Release
-      if: |
-        steps.get_commits.outputs.HAS_VALID_COMMITS == 'true' &&
-        steps.release_notes.outputs.SKIP_RELEASE != 'true'
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ steps.env.outputs.IMAGE_TAG }}
-        name: Release ${{ steps.env.outputs.IMAGE_TAG }} - ${{ env.SERVICE_NAME }}
+        tag_name: ${{ env.IMAGE_TAG }}
+        name: Release ${{ env.VERSION }} - ${{ env.SERVICE_NAME }}
         body_path: /tmp/release_notes.md
         draft: false
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Skip Release (no valid commits)
-      if: steps.get_commits.outputs.HAS_VALID_COMMITS != 'true'
-      run: |
-        echo "⚠ Skipping release: No commits with conventional prefixes found"
-        echo "Commits must have prefixes like: chore:, feat:, fix:, etc."
 
