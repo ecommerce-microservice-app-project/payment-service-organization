@@ -336,7 +336,7 @@ jobs:
 
   performance-tests:
     name: Run Performance Tests (Locust)
-    needs: deploy
+    needs: e2e-tests
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     
